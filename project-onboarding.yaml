@@ -1,0 +1,344 @@
+name: 'Unity Catalog: Project onboarding'
+on: 
+  workflow_dispatch:
+    inputs:      
+      businessAdlsName:
+        description: 'Business ADLS name'
+        type: string
+        required: true
+      businessSubscriptionId:
+        description: 'Business Subscription Id'
+        type: string
+        required: true
+      
+      projectNameAndCatalogNamePrefix: 
+        description: 'Project Name and Catalog Name'
+        type: string
+        default: '{ ProjectName: "", CatalogName: "" }'
+        required: true
+      CatalogNamePattern: 
+        description: 'Select Catalog Patteren'
+        type: choice
+        default: old
+        options:
+          -old
+          -New
+        required: true
+      
+      metastoreRegion: 
+        description: Metastore Region
+        type: choice
+        default: 'North Europe'
+        options:
+        - 'North Europe'
+        - 'West Europe'
+        - 'East US'
+        - 'Australia East'
+        - 'Australia Southeast'
+        - 'Southeast Asia'
+        required: true
+      zone:
+        description: Select zone
+        type: choice
+        default: 'deltalake'
+        options:
+          - 'deltalake'
+          - 'R, EU, EH, C'
+          
+      businessGroupOwners:
+        description: 'Business admin security group owners'
+        type: string
+        default: '@()'
+        required: true
+      projectGroupOwners:
+        description: 'Project user security group owners'
+        type: string
+        default: '@()'
+        required: true
+      
+      businessGroupDescription:
+        description: 'Business admin AAD group description'
+        type: string
+        default: 'This group manages the EDPL Business Admins in Unity Catalog for shellcorp. Managed by respective business SOM'
+        required: true
+      projectGroupDescription:
+        description: 'Project user AAD group description'
+        type: string
+        default: 'This group manages the EDPL Project Users in Unity Catalog for shellcorp. Managed by respective business SOM'
+        required: true
+      
+      serviceNowRequestId:
+        description: 'ServiceNow Request Id'
+        type: string
+        default: 'LIF Foundation'
+        required: true
+permissions:
+  id-token: write
+  contents: read
+env:
+        parameters.skipASOMOwners.value: 'True'
+        parameters.createGroupIfNotExists.value: 'True'
+        parameters.projectGroupOwners.value: ${{ github.event.inputs.projectGroupOwners }}
+        parameters.businessGroupOwners.value: ${{ github.event.inputs.businessGroupOwners }}
+        InputJsonFromMain: ${{ toJSON(github.event.inputs) }} #this is required to log input parameters in summary page 
+jobs:
+  setup-environment:
+    name: "Setting up environments"
+    runs-on: windows-latest
+    outputs:
+      environmentName: ${{ steps.setEnvironment.outputs.environmentName }}
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: 'Input parameters'
+        id: inputparams
+        uses: ./.github/actions/log-wf-inputs
+      - name: Set Environment
+        id: setEnvironment
+        uses: ./.github/actions/set-environment
+  unity-catalog-create-groups:
+    name: 'Project Onboarding - Create AAD groups'
+    runs-on: windows-latest    
+    needs: setup-environment   
+    environment: 
+      name: ${{ needs.setup-environment.outputs.environmentName }}
+    #Map a step output to a job output
+    outputs:
+      businessAdminGroupName: ${{ steps.generateName.outputs.businessAdminGroupName }}
+      projectUserGroupName: ${{ steps.generateName.outputs.projectUserGroupName }}
+      projectAdminGroupId: ${{ steps.EnsureBusinessadminSG.outputs.securityGroupObjectId }}
+      projectUserGroupId: ${{ steps.EnsureProjectUserSG.outputs.securityGroupObjectId }}
+      environmentName: ${{ needs.setup-environment.outputs.environmentName }}
+    steps:
+      - uses: actions/checkout@v4 
+      - name: 'GitHub action: Get variables from parameter file'
+        uses: ./.github/actions/set-env-vars
+        with:
+          varFilePath: ./.github/variables/${{ needs.setup-environment.outputs.environmentName }}.env
+      - name: OIDC Login to Azure
+        uses: azure/login@v2
+        with:
+          client-id: ${{ env.oidcSpnClientId }}
+          tenant-id: ${{ env.tenantId }}
+          allow-no-subscriptions: true
+          enable-AzPSSession: true
+     
+      - name: 'Generate 3 digit Environment Code'
+        shell: pwsh
+        run: |
+          ./common-scripts/ci-pipelines/helper-operations/generate-env-code.ps1 `
+            -TopLevelEnv ${env:parameters.topLevelEnv.value} `
+            -OperatingEnv ${env:parameters.operatingEnv.value} `
+            -SubscriptionClassEnv Topology
+      - name: 'Generate business domain name'
+        shell: pwsh
+        run: |        
+          ./common-scripts/ci-pipelines/business-operations/unity-catalog/generate-business-domain.ps1 `
+            -BusinessSubscriptionId '${{ github.event.inputs.businessSubscriptionId }}' `
+            -Environment ${env:pipeline.environment.value}
+
+      - name: 'Generate business code'
+        shell: pwsh
+        run: |        
+          ./common-scripts/ci-pipelines/helper-operations/generate-business-code.ps1 `
+            -BusinessSubscriptionId '${{ github.event.inputs.businessSubscriptionId }}' `
+            -Environment ${env:pipeline.environment.value}
+
+      - id: generateName
+        name: 'Generate group names'
+        shell: pwsh
+        run: |
+          $varprojectNameAndCatalogNamePrefix = $('${{ github.event.inputs.projectNameAndCatalogNamePrefix }}' | ConvertFrom-Json)
+          Write-Output $varprojectNameAndCatalogNamePrefix
+          $varProjectName = $($varprojectNameAndCatalogNamePrefix.ProjectName)
+          ./common-scripts/ci-pipelines/business-operations/unity-catalog/generate-group-names.ps1 `
+            -EnvCode ${env:parameters.envcodes.envcode.value} `
+            -BusinessCode ${env:businessCode} `
+            -ProjectName $varProjectName `
+            -BusinessDomain ${env:businessDomainName}
+    - name: 'Generate asset operating code'
+        shell: pwsh
+        run: |
+          ./common-scripts/ci-pipelines/helper-operations/generate-asset-operating-env.ps1 `
+            -OperatingEnvCode ${env:parameters.envcodes.operatingEnvCode.value}    
+      - name: 'Ensure Business admin SG'
+        id: EnsureBusinessadminSG
+        uses: azure/powershell@v2
+        with:
+          azPSVersion: "latest"
+          inlineScript: |
+            ./common-scripts/ci-pipelines/ensure-sg.ps1 `
+              -FuncAppBaseUrl ${env:parameters.ipawsApiBaseUrl.value} `
+              -SPNAppIdUri ${env:parameters.ipawsApiAudience.value} `
+              -ServiceName ${env:parameters.serviceName.value} `
+              -ServiceNowRequestId '${{ github.event.inputs.serviceNowRequestId }}' `
+              -BusinessCode ${env:businessCode} `
+              -AssetOperatingEnvironment ${env:groupAssetOperatingEnvironment} `
+              -Name '${{ steps.generateName.outputs.businessAdminGroupName }}' `
+              -Description '${{ github.event.inputs.businessGroupDescription }}' `
+              -SkipASOMOwners:([System.Convert]::ToBoolean(${env:parameters.skipASOMOwners.value})) `
+              -Owners (Invoke-Expression ${env:parameters.businessGroupOwners.value}) `
+              -SGObjectIdCIVariableName "securityGroupObjectId" `
+              -CreateGroupIfNotExist: ([System.Convert]::ToBoolean(${env:parameters.createGroupIfNotExists.value}))
+              -catalognamepattern '${{ github.event.inputs.CatalogNamePattern}}'
+          failOnStandardError: $true
+      - name: 'Add SG Members - Business admin group'
+        if: ${{ env.securityGroupObjectId != '' && github.event.inputs.businessGroupOwners != '@()' && env.AdminGroupAlreadyExists == '''false''' }}
+        uses: azure/powershell@v2
+        with:
+          azPSVersion: "latest"
+          inlineScript: |
+            ./common-scripts/ci-pipelines/add-sg-members.ps1 `
+              -FuncAppBaseUrl ${env:parameters.ipawsApiBaseUrl.value} `
+              -SPNAppIdUri ${env:parameters.ipawsApiAudience.value} `
+              -SGObjectId ${env:securityGroupObjectId} `
+              -Members (Invoke-Expression ${env:parameters.businessGroupOwners.value})
+          failOnStandardError: $true
+      - name: 'Ensure Project user SG'
+        id: EnsureProjectUserSG
+        uses: azure/powershell@v2
+        with:
+          azPSVersion: "latest"
+          inlineScript: |
+            ./common-scripts/ci-pipelines/ensure-sg.ps1 `
+              -FuncAppBaseUrl ${env:parameters.ipawsApiBaseUrl.value} `
+              -SPNAppIdUri ${env:parameters.ipawsApiAudience.value} `
+              -ServiceName ${env:parameters.serviceName.value} `
+              -ServiceNowRequestId '${{ github.event.inputs.serviceNowRequestId }}' `
+              -BusinessCode ${env:businessCode} `
+              -AssetOperatingEnvironment ${env:groupAssetOperatingEnvironment} `
+              -Name '${{ steps.generateName.outputs.projectUserGroupName }}' `
+              -Description '${{ github.event.inputs.businessGroupDescription }}' `
+              -SkipASOMOwners:([System.Convert]::ToBoolean(${env:parameters.skipASOMOwners.value}))
+              -Owners (Invoke-Expression ${env:parameters.projectGroupOwners.value}) `
+              -SGObjectIdCIVariableName "securityGroupObjectId" `
+              -CreateGroupIfNotExist: ([System.Convert]::ToBoolean(${env:parameters.createGroupIfNotExists.value}))
+              -catalognamepattern '${{ github.event.inputs.CatalogNamePattern}}'
+          failOnStandardError: $true
+      - name: 'Add SG Members - Project user group'
+        if: ${{ env.securityGroupObjectId != '' && github.event.inputs.projectGroupOwners != '@()' }}
+        uses: azure/powershell@v2
+        with:
+          azPSVersion: "latest"
+          inlineScript: |
+            ./common-scripts/ci-pipelines/add-sg-members.ps1 `
+              -FuncAppBaseUrl ${env:parameters.ipawsApiBaseUrl.value} `
+              -SPNAppIdUri ${env:parameters.ipawsApiAudience.value} `
+              -SGObjectId ${env:securityGroupObjectId} `
+              -Members (Invoke-Expression ${env:parameters.projectGroupOwners.value})
+          failOnStandardError: $true
+  unity-catalog-assign-owner:
+    name: 'Project Onboarding - Assign owner role to AAD groups'
+    runs-on: windows-latest
+    needs: unity-catalog-create-groups
+    environment: 
+      name: ${{ needs.unity-catalog-create-groups.outputs.environmentName }}
+    steps:
+      - uses: actions/checkout@v4
+    
+      - name: 'GitHub action: Get variables from parameter file'
+        uses: ./.github/actions/set-env-vars
+        with:
+          varFilePath: ./.github/variables/${{ needs.unity-catalog-create-groups.outputs.environmentName }}.env
+      - name: OIDC Login to Azure
+        uses: azure/login@v2
+        with:
+          client-id: ${{ env.oidcSpnClientId }}
+          tenant-id: ${{ env.tenantId }}
+          allow-no-subscriptions: true
+          enable-AzPSSession: true
+     
+      - name: 'Generate 3 digit Environment Code'
+        shell: pwsh
+        run: |
+          ./common-scripts/ci-pipelines/helper-operations/generate-env-code.ps1 `
+            -TopLevelEnv ${env:parameters.topLevelEnv.value} `
+            -OperatingEnv ${env:parameters.operatingEnv.value} `
+            -SubscriptionClassEnv Topology  
+      - name: 'Set region code'
+        shell: pwsh
+        run: |
+          ./common-scripts/ci-pipelines/helper-operations/set-region-code.ps1 `
+              -Region '${{ github.event.inputs.metastoreRegion }}'
+      - name: 'Generate business domain name'
+        shell: pwsh
+        run: |        
+          ./common-scripts/ci-pipelines/business-operations/unity-catalog/generate-business-domain.ps1 `
+            -BusinessSubscriptionId '${{ github.event.inputs.businessSubscriptionId }}' `
+            -Environment ${env:pipeline.environment.value}
+      - name: 'Generate business code'
+        shell: pwsh
+        run: |        
+          ./common-scripts/ci-pipelines/helper-operations/generate-business-code.ps1 `
+            -BusinessSubscriptionId '${{ github.event.inputs.businessSubscriptionId }}' `
+            -Environment ${env:pipeline.environment.value}
+      - name: 'Check if business admin group is present in Unity Catalog'
+        uses: azure/powershell@v2
+        with:
+          azPSVersion: "latest"
+          inlineScript: |
+            ./common-scripts/ci-pipelines/business-operations/unity-catalog/check-uc-group.ps1 `
+              -SGObjectId '${{needs.unity-catalog-create-groups.outputs.projectadminGroupId}}' `
+              -GroupName '${{needs.unity-catalog-create-groups.outputs.businessAdminGroupName}}' `
+              -UCFuncAppBaseUrl ${env:parameters.ucApiBaseUrl.value} `
+              -UCApiAudience ${env:parameters.ucApiAudience.value} 
+          failOnStandardError: $true
+      - name: 'Check if project user group is present in Unity Catalog'
+        uses: azure/powershell@v2
+        with:
+          azPSVersion: "latest"
+          inlineScript: |
+            ./common-scripts/ci-pipelines/business-operations/unity-catalog/check-uc-group.ps1 `
+              -SGObjectId '${{needs.unity-catalog-create-groups.outputs.projectUserGroupId}}' `
+              -GroupName '${{needs.unity-catalog-create-groups.outputs.projectUserGroupName}}' `
+              -UCFuncAppBaseUrl ${env:parameters.ucApiBaseUrl.value} `
+              -UCApiAudience ${env:parameters.ucApiAudience.value}
+          failOnStandardError: $true
+      - name: 'Assign owner role to business admin AAD group'
+        uses: azure/powershell@v2
+        with:
+          azPSVersion: "latest"
+          inlineScript: |
+            $ZoneValue="deltalake"
+            if("${{ github.event.inputs.zone }}" -eq "R, EU, EH, C"){
+              $ZoneValue="raw,enriched-harmonized,enriched-unharmonized,curated";
+            }
+            $varprojectNameAndCatalogNamePrefix = $('${{ github.event.inputs.projectNameAndCatalogNamePrefix }}' | ConvertFrom-Json)
+            Write-Output $varprojectNameAndCatalogNamePrefix
+            
+            $varCatalogNamePrefix = $($varprojectNameAndCatalogNamePrefix.CatalogName)
+            ./common-scripts/ci-pipelines/business-operations/unity-catalog/update-owner.ps1 `
+              -GroupName '${{needs.unity-catalog-create-groups.outputs.businessAdminGroupName}}' `
+              -MetastoreRegionCode ${env:regionCode} `
+              -EnvCode ${env:parameters.envcodes.envcode.value} `
+              -UCFuncAppBaseUrl ${env:parameters.ucApiBaseUrl.value} `
+              -UCApiAudience ${env:parameters.ucApiAudience.value} `
+              -BusinessDomain ${env:businessDomainName} `
+              -BusinessAdls ${{ github.event.inputs.businessAdlsName }} `
+              -CatalogPrefix $varCatalogNamePrefix `
+              -Containers "$ZoneValue"
+              -CatalogNamePattern '${{ github.event.inputs.CatalogNamePattern}}'
+          failOnStandardError: $true
+      - name: 'Execution summary'
+        shell: pwsh
+        run: | 
+          ./common-scripts/ci-pipelines/business-operations/unity-catalog/project-onboarding-execution-summary.ps1
+            
+      - name: 'Upload artifacts' 
+        uses: actions/upload-artifact@v4
+        with:
+          name: project-onboarding-artifact
+          path: |
+            ${{ github.workspace }}/project-onboarding-artifact.json
+
+<#
+i. "$envPrefix$BusinessDomain-unitycatalog-dev"
+ii. "$envPrefix$BusinessDomain-unitycatalog-tst"
+iii. "$envPrefix$BusinessDomain-unitycatalog-uat"
+
+
+a. Three catalogs
+ i. $CatalogPrefix_dev
+ ii. $CatalogPrefix_tst
+ iii. $CatalogPrefix_uat
+#>
